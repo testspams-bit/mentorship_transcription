@@ -1,0 +1,6 @@
+{
+  "name": "NEET Audio Vault - Categorization & Transcript Hub",
+  "description": "Upload, categorize, listen to and transcribe segmented mentorship and coaching audio recordings with timestamped transcripts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
