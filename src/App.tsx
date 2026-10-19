@@ -1,28 +1,39 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   Headphones,
-  Upload,
+  Link2,
   Search,
-  Clock,
+  Upload,
   Play,
   Pause,
-  Volume2,
-  VolumeX,
   FastForward,
   Rewind,
-  X
+  Loader2,
+  Check,
+  X,
+  Volume2,
+  VolumeX
 } from 'lucide-react';
 import { AudioSegment, PlaybackState } from './types/audio';
 import { PRELOADED_SEGMENTS } from './data/preloadedSegments';
 import { AudioItemCard } from './components/AudioItemCard';
 import { audioPlayer } from './utils/audioPlayerManager';
+import { downloadFromMegaUrl, MegaDownloadProgress } from './utils/megaDownloader';
+import { saveAudioBlob, getAudioBlob } from './utils/audioStorage';
 import { processZipFile, processAudioFiles } from './utils/zipHandler';
 
 export default function App() {
   const [segments, setSegments] = useState<AudioSegment[]>(PRELOADED_SEGMENTS);
   const [searchQuery, setSearchQuery] = useState('');
-  const [isUploading, setIsUploading] = useState(false);
-  const [uploadNote, setUploadNote] = useState<string | null>(null);
+  const [selectedTag, setSelectedTag] = useState<string | null>(null);
+
+  // MEGA URL & Download state
+  const [megaUrl, setMegaUrl] = useState('');
+  const [isMegaDownloading, setIsMegaDownloading] = useState(false);
+  const [megaProgress, setMegaProgress] = useState<MegaDownloadProgress | null>(null);
+  const [megaError, setMegaError] = useState<string | null>(null);
+  const [hasMasterAudio, setHasMasterAudio] = useState(false);
+  const [masterFilename, setMasterFilename] = useState<string | null>(null);
 
   const [playbackState, setPlaybackState] = useState<PlaybackState>({
     currentSegmentId: null,
@@ -40,81 +51,93 @@ export default function App() {
       setPlaybackState(state);
     });
 
-    // Check IndexedDB for previously uploaded recordings
-    import('./utils/audioStorage').then(({ getAllStoredAudios }) => {
-      getAllStoredAudios().then(stored => {
-        const keys = Object.keys(stored);
-        if (keys.length > 0) {
-          setSegments(prev =>
-            prev.map(seg => {
-              const matchingBlob =
-                stored[seg.id.toLowerCase()] ||
-                stored[seg.rawFilename.toLowerCase()] ||
-                stored[seg.serialNumber.toLowerCase()];
-
-              if (matchingBlob) {
-                return {
-                  ...seg,
-                  audioBlobUrl: URL.createObjectURL(matchingBlob),
-                  isUploadedAudio: true,
-                };
-              }
-              return seg;
-            })
-          );
-        }
-      });
+    // Check if master audio was saved in IndexedDB from a previous MEGA download
+    getAudioBlob('master_mega_recording').then(blob => {
+      if (blob) {
+        const url = URL.createObjectURL(blob);
+        audioPlayer.setMasterAudio(url);
+        setHasMasterAudio(true);
+        setMasterFilename('Cached Master Recording');
+      }
     });
 
     return () => unsubscribe();
   }, []);
+
+  // Handle MEGA download of the entire file at once
+  const handleDownloadMega = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!megaUrl.trim()) return;
+
+    setIsMegaDownloading(true);
+    setMegaError(null);
+
+    try {
+      const { blob, filename } = await downloadFromMegaUrl(megaUrl, progress => {
+        setMegaProgress(progress);
+      });
+
+      const audioUrl = URL.createObjectURL(blob);
+      audioPlayer.setMasterAudio(audioUrl);
+      setHasMasterAudio(true);
+      setMasterFilename(filename);
+
+      // Save to IndexedDB persistently
+      await saveAudioBlob('master_mega_recording', blob);
+      await saveAudioBlob(filename, blob);
+
+      setMegaProgress(null);
+    } catch (err: any) {
+      console.error(err);
+      setMegaError(err?.message || 'Failed to download or decrypt from MEGA URL. Check link permissions.');
+    } finally {
+      setIsMegaDownloading(false);
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    const fileArray = Array.from(files);
+    const firstAudio = fileArray.find(f => /\.(mp3|wav|m4a|ogg)$/i.test(f.name));
+    const zipFile = fileArray.find(f => f.name.toLowerCase().endsWith('.zip'));
+
+    if (zipFile) {
+      const res = await processZipFile(zipFile, segments);
+      setSegments(res.segments);
+    } else if (firstAudio) {
+      const audioUrl = URL.createObjectURL(firstAudio);
+      audioPlayer.setMasterAudio(audioUrl);
+      setHasMasterAudio(true);
+      setMasterFilename(firstAudio.name);
+      await saveAudioBlob('master_mega_recording', firstAudio);
+    }
+  };
 
   const currentSegment = useMemo(() => {
     if (!playbackState.currentSegmentId) return null;
     return segments.find(s => s.id === playbackState.currentSegmentId) || null;
   }, [playbackState.currentSegmentId, segments]);
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    setIsUploading(true);
-    setUploadNote('Processing files...');
-
-    try {
-      const fileArray = Array.from(files);
-      const zipFile = fileArray.find(f => f.name.toLowerCase().endsWith('.zip'));
-
-      let res;
-      if (zipFile) {
-        setUploadNote(`Unpacking ${zipFile.name}...`);
-        res = await processZipFile(zipFile, segments);
-      } else {
-        res = await processAudioFiles(fileArray, segments);
-      }
-
-      setSegments(res.segments);
-      setUploadNote(`Loaded ${res.audioCount} audio files.`);
-      setTimeout(() => setUploadNote(null), 4000);
-    } catch (err: any) {
-      setUploadNote(`Error: ${err.message || 'Failed to upload'}`);
-    } finally {
-      setIsUploading(false);
-    }
-  };
-
-  const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  // Extract all 24 distinct tags
+  const allTags = useMemo(() => {
+    const tagsSet = new Set<string>();
+    segments.forEach(s => {
+      if (s.primaryTag) tagsSet.add(s.primaryTag);
+    });
+    return Array.from(tagsSet);
+  }, [segments]);
 
   const filteredSegments = useMemo(() => {
     let list = segments;
 
-    // Tag filter
     if (selectedTag) {
       list = list.filter(
         s => s.primaryTag?.toLowerCase() === selectedTag.toLowerCase()
       );
     }
 
-    // Search query filter
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       list = list.filter(
@@ -122,155 +145,160 @@ export default function App() {
           s.title.toLowerCase().includes(q) ||
           s.rawFilename.toLowerCase().includes(q) ||
           s.serialNumber.toLowerCase().includes(q) ||
-          s.fullTranscriptText.toLowerCase().includes(q) ||
-          s.primaryTag?.toLowerCase().includes(q)
+          s.primaryTag?.toLowerCase().includes(q) ||
+          s.fullTranscriptText.toLowerCase().includes(q)
       );
     }
 
     return list;
   }, [segments, selectedTag, searchQuery]);
 
+  const formatTime = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 pb-28">
-      {/* Top Navbar */}
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 pb-24 font-sans">
+      {/* Minimal Top Header */}
       <header className="sticky top-0 z-30 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-b border-slate-200 dark:border-slate-800">
-        <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold text-sm">
-              <Headphones className="w-4 h-4" />
+        <div className="max-w-4xl mx-auto px-4 h-14 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold text-xs">
+              <Headphones className="w-3.5 h-3.5" />
             </div>
-            <div>
-              <h1 className="text-base font-bold text-slate-900 dark:text-white leading-tight">
-                NEET Audio Recordings
-              </h1>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                21 Audio Recordings &amp; Actual Transcripts
-              </p>
-            </div>
+            <h1 className="text-sm font-bold text-slate-900 dark:text-white">
+              NEET Recordings ({segments.length} Cards)
+            </h1>
           </div>
 
-          <div className="flex items-center gap-3">
-            <label className="cursor-pointer flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 text-white dark:bg-indigo-600 hover:bg-slate-800 dark:hover:bg-indigo-700 text-xs font-semibold transition">
-              <Upload className="w-3.5 h-3.5" />
-              <span>{isUploading ? 'Uploading...' : 'Upload ZIP / Audio'}</span>
-              <input
-                type="file"
-                accept=".zip,.mp3,.wav,.m4a"
-                multiple
-                onChange={handleFileUpload}
-                className="hidden"
-              />
-            </label>
-          </div>
+          {/* Quick upload fallback option */}
+          <label className="cursor-pointer text-xs text-slate-500 hover:text-indigo-600 dark:hover:text-indigo-400 font-medium flex items-center gap-1">
+            <Upload className="w-3 h-3" />
+            <span>Load Local File</span>
+            <input
+              type="file"
+              accept=".zip,.mp3,.wav,.m4a"
+              multiple
+              onChange={handleFileUpload}
+              className="hidden"
+            />
+          </label>
         </div>
       </header>
 
-      {/* Main Content Area */}
-      <main className="max-w-5xl mx-auto px-4 pt-6 space-y-4">
-        {/* Upload Status Banner */}
-        {uploadNote && (
-          <div className="p-3 rounded-lg bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800 text-xs sm:text-sm text-indigo-900 dark:text-indigo-200 flex items-center justify-between">
-            <span>{uploadNote}</span>
-            <button onClick={() => setUploadNote(null)}>
-              <X className="w-4 h-4" />
+      <main className="max-w-4xl mx-auto px-4 pt-4 space-y-3.5">
+        {/* MEGA Share Link Input (Downloads entire URL at once) */}
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3 shadow-sm space-y-2">
+          <form onSubmit={handleDownloadMega} className="flex flex-col sm:flex-row gap-2">
+            <div className="relative flex-1">
+              <Link2 className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="url"
+                placeholder="Paste MEGA share link (e.g. https://mega.nz/file/...#...)"
+                value={megaUrl}
+                onChange={e => setMegaUrl(e.target.value)}
+                disabled={isMegaDownloading}
+                className="w-full pl-9 pr-3 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/80 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={isMegaDownloading || !megaUrl.trim()}
+              className="px-3.5 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 text-xs font-semibold flex items-center justify-center gap-1.5 shrink-0 transition"
+            >
+              {isMegaDownloading ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Downloading MEGA...</span>
+                </>
+              ) : (
+                <span>Download Entire URL</span>
+              )}
             </button>
-          </div>
-        )}
+          </form>
+
+          {/* MEGA Status & Feedback */}
+          {megaProgress && (
+            <div className="text-xs text-indigo-600 dark:text-indigo-400 flex items-center gap-2">
+              <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+              <span>{megaProgress.status}</span>
+            </div>
+          )}
+
+          {megaError && (
+            <div className="text-xs text-rose-600 dark:text-rose-400">
+              {megaError}
+            </div>
+          )}
+
+          {hasMasterAudio && (
+            <div className="text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
+              <Check className="w-3.5 h-3.5 text-emerald-500" />
+              <span>
+                Master audio connected ({masterFilename || 'Original file'}). Cards will play only their labeled section.
+              </span>
+            </div>
+          )}
+        </div>
 
         {/* Search Bar */}
         <div className="relative">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
             placeholder="Search within recordings or transcripts..."
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            className="w-full pl-8 pr-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500"
           />
           {searchQuery && (
             <button
               onClick={() => setSearchQuery('')}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400 hover:text-slate-600"
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] text-slate-400 hover:text-slate-600"
             >
               Clear
             </button>
           )}
         </div>
 
-        {/* Audio Source Status Notice */}
-        {segments.some(s => s.isUploadedAudio) ? (
-          <div className="px-4 py-2.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 text-xs text-emerald-800 dark:text-emerald-300 flex items-center justify-between">
-            <span>
-              ✓ <strong>Original recordings loaded:</strong> Playing your actual audio files directly on each card.
-            </span>
-          </div>
-        ) : (
-          <div className="px-4 py-3 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <span>
-              ℹ️ Currently in <strong>speech preview mode</strong>. To play your <strong>actual voice recordings</strong>, click <strong>"Upload ZIP / Audio"</strong> above and select your ZIP or MP3 files.
-            </span>
-          </div>
-        )}
-
-        {/* 21 Tags Filter Section (Above 21 Cards, small fonts, max 2 words each) */}
-        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
-              Filter by Tag ({selectedTag ? `1 active: ${selectedTag}` : '21 Tags'})
-            </span>
+        {/* 24 Distinct Tags Filter (Small fonts, max 2 words each) */}
+        <div className="space-y-1">
+          <div className="flex items-center justify-between text-[11px] text-slate-500 font-semibold uppercase tracking-wider">
+            <span>Tags ({allTags.length})</span>
             {selectedTag && (
               <button
                 onClick={() => setSelectedTag(null)}
-                className="text-[11px] font-semibold text-indigo-600 dark:text-indigo-400 hover:underline"
+                className="text-indigo-600 dark:text-indigo-400 hover:underline capitalize"
               >
-                Reset Filter (Show All 21)
+                Clear Tag Filter
               </button>
             )}
           </div>
 
-          <div className="flex flex-wrap gap-1.5">
+          <div className="flex flex-wrap gap-1">
             <button
               onClick={() => setSelectedTag(null)}
-              className={`px-2 py-0.5 rounded text-xs font-mono transition-colors border ${
+              className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors border ${
                 selectedTag === null
-                  ? 'bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-slate-900 dark:border-white font-bold'
-                  : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700 hover:border-slate-400'
+                  ? 'bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-slate-900 font-bold'
+                  : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-800 hover:border-slate-400'
               }`}
             >
               #all
             </button>
-            {[
-              '#test anxiety',
-              '#ncert biology',
-              '#botany faculty',
-              '#dipole calculus',
-              '#assertion reason',
-              '#tissues organs',
-              '#physics derivations',
-              '#test design',
-              '#time management',
-              '#cbt mode',
-              '#redox chemistry',
-              '#capacitors doubt',
-              '#series parallel',
-              '#graph questions',
-              '#isomerism struggles',
-              '#ms chouhan',
-              '#topic booster',
-              '#batch pacing',
-              '#rank target',
-              '#pyq focus',
-              '#daily schedule',
-            ].map(tag => {
+
+            {allTags.map(tag => {
               const isSelected = selectedTag === tag;
               return (
                 <button
                   key={tag}
                   onClick={() => setSelectedTag(isSelected ? null : tag)}
-                  className={`px-2 py-0.5 rounded text-xs font-mono transition-colors border ${
+                  className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors border ${
                     isSelected
-                      ? 'bg-indigo-600 text-white border-indigo-600 font-bold shadow-sm'
-                      : 'bg-slate-50 dark:bg-slate-800/80 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700/80 hover:border-indigo-400 hover:text-indigo-600 dark:hover:text-indigo-400'
+                      ? 'bg-indigo-600 text-white border-indigo-600 font-bold'
+                      : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-800 hover:border-indigo-400 hover:text-indigo-600'
                   }`}
                 >
                   {tag}
@@ -280,11 +308,11 @@ export default function App() {
           </div>
         </div>
 
-        {/* 21 Cards List */}
-        <div className="space-y-3">
+        {/* The 24 Small Cards: Only one title, one play icon, one transcript icon */}
+        <div className="space-y-2">
           {filteredSegments.length === 0 ? (
-            <div className="text-center py-12 text-slate-500 text-sm">
-              No recordings matching "{selectedTag || searchQuery}"
+            <div className="text-center py-8 text-slate-500 text-xs">
+              No cards matching filter
             </div>
           ) : (
             filteredSegments.map(segment => (
@@ -299,63 +327,34 @@ export default function App() {
         </div>
       </main>
 
-      {/* Bottom Sticky Player if a track is active */}
+      {/* Basic Bottom Audio Player */}
       {currentSegment && (
-        <div className="fixed bottom-0 left-0 right-0 z-40 bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 px-4 py-3 shadow-lg">
-          <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
-            <div className="flex items-center gap-3 w-full sm:w-auto min-w-0">
-              <span className="font-mono text-xs font-bold px-2 py-1 rounded bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300">
+        <div className="fixed bottom-0 left-0 right-0 z-40 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-t border-slate-200 dark:border-slate-800 px-4 py-2.5 shadow-md">
+          <div className="max-w-4xl mx-auto flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="font-mono text-xs font-bold text-indigo-600 dark:text-indigo-400">
                 #{currentSegment.serialNumber}
               </span>
-              <div className="min-w-0">
-                <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
-                  {currentSegment.title}
-                </p>
-                <p className="text-xs text-slate-500 font-mono">
-                  {currentSegment.startTime} - {currentSegment.endTime}
-                </p>
-              </div>
+              <p className="text-xs font-medium text-slate-900 dark:text-white truncate">
+                {currentSegment.title}
+              </p>
             </div>
 
-            <div className="flex items-center gap-3 w-full sm:w-auto justify-end">
-              <button
-                onClick={() => audioPlayer.skip(-10)}
-                className="p-1.5 text-slate-500 hover:text-slate-900 dark:hover:text-white"
-                title="Rewind 10s"
-              >
-                <Rewind className="w-4 h-4" />
-              </button>
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="text-xs font-mono text-slate-500">
+                {formatTime(playbackState.currentTime)} / {formatTime(playbackState.duration)}
+              </span>
 
               <button
                 onClick={() => audioPlayer.togglePlay()}
-                className="w-9 h-9 rounded-full bg-indigo-600 text-white flex items-center justify-center hover:bg-indigo-700 transition"
+                className="w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center hover:bg-indigo-700 transition"
               >
                 {playbackState.isPlaying ? (
-                  <Pause className="w-4 h-4 fill-current" />
+                  <Pause className="w-3.5 h-3.5 fill-current" />
                 ) : (
-                  <Play className="w-4 h-4 fill-current ml-0.5" />
+                  <Play className="w-3.5 h-3.5 fill-current ml-0.5" />
                 )}
               </button>
-
-              <button
-                onClick={() => audioPlayer.skip(10)}
-                className="p-1.5 text-slate-500 hover:text-slate-900 dark:hover:text-white"
-                title="Forward 10s"
-              >
-                <FastForward className="w-4 h-4" />
-              </button>
-
-              <select
-                value={playbackState.playbackRate}
-                onChange={e => audioPlayer.setRate(parseFloat(e.target.value))}
-                className="text-xs font-semibold px-2 py-1 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300"
-              >
-                <option value="0.75">0.75x</option>
-                <option value="1.0">1.0x</option>
-                <option value="1.25">1.25x</option>
-                <option value="1.5">1.5x</option>
-                <option value="2.0">2.0x</option>
-              </select>
             </div>
           </div>
         </div>

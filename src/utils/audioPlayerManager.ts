@@ -11,6 +11,8 @@ class AudioPlayerManager {
   private synthInterval: number | null = null;
   private virtualTime = 0;
   private virtualDuration = 180;
+  private masterAudioUrl: string | null = null;
+
   private state: PlaybackState = {
     currentSegmentId: null,
     isPlaying: false,
@@ -27,14 +29,55 @@ class AudioPlayerManager {
     this.setupAudioListeners();
   }
 
+  public setMasterAudio(url: string) {
+    this.masterAudioUrl = url;
+    this.audioElement.src = url;
+    this.audioElement.load();
+  }
+
+  public getMasterAudioUrl(): string | null {
+    return this.masterAudioUrl;
+  }
+
   private setupAudioListeners() {
     this.audioElement.addEventListener('timeupdate', () => {
-      if (!this.isUsingSynth) {
-        this.updateState({
-          currentTime: this.audioElement.currentTime,
-          duration: this.audioElement.duration || this.state.duration,
-          activeLineIndex: this.calculateActiveLineIndex(this.audioElement.currentTime),
-        });
+      if (!this.isUsingSynth && this.currentSegment) {
+        const rawTime = this.audioElement.currentTime;
+
+        // If playing from master audio (where total duration > segment duration)
+        if (this.masterAudioUrl && (!this.currentSegment.audioBlobUrl || this.currentSegment.audioBlobUrl === this.masterAudioUrl)) {
+          // Check if we reached or exceeded the end of the labelled segment
+          if (rawTime >= this.currentSegment.endSeconds) {
+            this.pause();
+            this.audioElement.currentTime = this.currentSegment.startSeconds;
+            this.updateState({
+              isPlaying: false,
+              currentTime: this.currentSegment.endSeconds - this.currentSegment.startSeconds,
+            });
+            return;
+          }
+
+          // If somehow time is before segment start, seek to start
+          if (rawTime < this.currentSegment.startSeconds - 1) {
+            this.audioElement.currentTime = this.currentSegment.startSeconds;
+          }
+
+          const relativeCurrentTime = Math.max(0, rawTime - this.currentSegment.startSeconds);
+          const segmentDuration = Math.max(1, this.currentSegment.endSeconds - this.currentSegment.startSeconds);
+
+          this.updateState({
+            currentTime: relativeCurrentTime,
+            duration: segmentDuration,
+            activeLineIndex: this.calculateActiveLineIndex(rawTime),
+          });
+        } else {
+          // Dedicated cut clip
+          this.updateState({
+            currentTime: rawTime,
+            duration: this.audioElement.duration || this.state.duration,
+            activeLineIndex: this.calculateActiveLineIndex(rawTime),
+          });
+        }
       }
     });
 
@@ -51,21 +94,21 @@ class AudioPlayerManager {
     });
 
     this.audioElement.addEventListener('loadedmetadata', () => {
-      this.updateState({
-        duration: this.audioElement.duration || this.state.duration,
-      });
+      if (this.currentSegment) {
+        const segDur = this.currentSegment.endSeconds - this.currentSegment.startSeconds;
+        this.updateState({
+          duration: segDur > 0 ? segDur : this.audioElement.duration || this.state.duration,
+        });
+      }
     });
   }
 
   private calculateActiveLineIndex(time: number): number {
     if (!this.currentSegment || !this.currentSegment.transcriptLines.length) return 0;
     const lines = this.currentSegment.transcriptLines;
-    
-    // Check if lines have relative seconds or absolute seconds
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      // If audio file is a cut clip, time starts at 0 up to duration
-      // Check both relative time (offset from start) and absolute time
       const relStart = line.startSec - this.currentSegment.startSeconds;
       const relEnd = line.endSec - this.currentSegment.startSeconds;
 
@@ -101,7 +144,8 @@ class AudioPlayerManager {
 
     const segmentDuration = Math.max(1, segment.endSeconds - segment.startSeconds);
 
-    if (segment.audioBlobUrl) {
+    // Case 1: Individual audio blob exists for this segment
+    if (segment.audioBlobUrl && segment.audioBlobUrl !== this.masterAudioUrl) {
       this.isUsingSynth = false;
       if (isNew || this.audioElement.src !== segment.audioBlobUrl) {
         this.audioElement.src = segment.audioBlobUrl;
@@ -120,13 +164,43 @@ class AudioPlayerManager {
       try {
         await this.audioElement.play();
       } catch (err) {
-        console.warn('Audio play prevented or error, falling back to speech preview:', err);
+        console.warn('Playback error:', err);
         this.playWithSynth(segment, startOffset);
       }
-    } else {
-      // Preloaded segment without uploaded audio file: use synchronized synthesized voice preview
-      this.playWithSynth(segment, startOffset);
+      return;
     }
+
+    // Case 2: Master audio URL downloaded from MEGA / loaded at once
+    if (this.masterAudioUrl) {
+      this.isUsingSynth = false;
+      if (this.audioElement.src !== this.masterAudioUrl) {
+        this.audioElement.src = this.masterAudioUrl;
+        this.audioElement.load();
+      }
+      this.audioElement.playbackRate = this.state.playbackRate;
+      this.audioElement.volume = this.state.isMuted ? 0 : this.state.volume;
+
+      const targetStart = segment.startSeconds + startOffset;
+      this.audioElement.currentTime = targetStart;
+
+      this.updateState({
+        currentSegmentId: segment.id,
+        duration: segmentDuration,
+        currentTime: startOffset,
+        isPlaying: true,
+      });
+
+      try {
+        await this.audioElement.play();
+      } catch (err) {
+        console.warn('Playback error with master audio:', err);
+        this.playWithSynth(segment, startOffset);
+      }
+      return;
+    }
+
+    // Case 3: Speech preview fallback
+    this.playWithSynth(segment, startOffset);
   }
 
   private playWithSynth(segment: AudioSegment, startOffset = 0) {
@@ -145,13 +219,11 @@ class AudioPlayerManager {
 
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
-      // Read active transcript text
       const fullText = segment.transcriptLines.map(l => `${l.speaker}: ${l.text}`).join('. ');
       const utterance = new SpeechSynthesisUtterance(fullText.slice(0, 1500));
       utterance.rate = Math.min(2, Math.max(0.7, this.state.playbackRate * 1.05));
       utterance.volume = this.state.isMuted ? 0 : this.state.volume;
 
-      // Try selecting a Hindi/Indian voice if available
       const voices = window.speechSynthesis.getVoices();
       const hindiVoice = voices.find(v => v.lang.includes('hi') || v.lang.includes('en-IN'));
       if (hindiVoice) utterance.voice = hindiVoice;
@@ -168,7 +240,6 @@ class AudioPlayerManager {
       window.speechSynthesis.speak(utterance);
     }
 
-    // Interval to tick virtual progress
     if (this.synthInterval) clearInterval(this.synthInterval);
     this.synthInterval = window.setInterval(() => {
       if (this.isUsingSynth && this.state.isPlaying) {
@@ -234,12 +305,21 @@ class AudioPlayerManager {
         currentTime: this.virtualTime,
         activeLineIndex: this.calculateActiveLineIndex(this.virtualTime),
       });
-    } else {
-      this.audioElement.currentTime = seconds;
-      this.updateState({
-        currentTime: seconds,
-        activeLineIndex: this.calculateActiveLineIndex(seconds),
-      });
+    } else if (this.currentSegment) {
+      if (this.masterAudioUrl && (!this.currentSegment.audioBlobUrl || this.currentSegment.audioBlobUrl === this.masterAudioUrl)) {
+        const target = this.currentSegment.startSeconds + Math.max(0, Math.min(seconds, this.currentSegment.endSeconds - this.currentSegment.startSeconds));
+        this.audioElement.currentTime = target;
+        this.updateState({
+          currentTime: seconds,
+          activeLineIndex: this.calculateActiveLineIndex(target),
+        });
+      } else {
+        this.audioElement.currentTime = seconds;
+        this.updateState({
+          currentTime: seconds,
+          activeLineIndex: this.calculateActiveLineIndex(seconds),
+        });
+      }
     }
   }
 
